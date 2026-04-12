@@ -56,18 +56,40 @@ GANK_JG_NEARBY_SECONDS  = 15   # jungler seen < Xs ago → don't gank that side
 # ── Champion database ────────────────────────
 # Bonus gank score added for champions that synergise well
 CHAMPION_GANK_BONUS = {
-    "Warwick":  {"pre6": 0,  "post6": 25},   # ult is a lock-on engage
-    "Kayn":     {"pre6": 5,  "post6": 15},
-    "Hecarim":  {"pre6": 10, "post6": 10},   # speed makes all ganks better
-    "Vi":       {"pre6": 10, "post6": 20},
-    "Zac":      {"pre6": 15, "post6": 20},
-    "Amumu":    {"pre6": 5,  "post6": 20},
-    "Jarvan":   {"pre6": 15, "post6": 15},
-    "Nocturne": {"pre6": 0,  "post6": 30},   # ult dramatically improves ganks
-    "Shaco":    {"pre6": 20, "post6": 20},
-    "Master Yi": {"pre6": 0, "post6": 5},    # Yi doesn't gank well
-    "Karthus":  {"pre6": 0,  "post6": 0},
+    "Warwick":   {"pre6": 0,  "post6": 25},  # ult is a lock-on engage
+    "Kayn":      {"pre6": 8,  "post6": 18},  # wall traversal is always useful
+    "Viego":     {"pre6": 12, "post6": 22},  # strong duelist, W sustain = gank then reset
+    "Hecarim":   {"pre6": 10, "post6": 10},  # speed makes all ganks better
+    "Vi":        {"pre6": 10, "post6": 20},
+    "Zac":       {"pre6": 15, "post6": 20},
+    "Amumu":     {"pre6": 5,  "post6": 20},
+    "Jarvan":    {"pre6": 15, "post6": 15},
+    "Nocturne":  {"pre6": 0,  "post6": 30},  # ult dramatically improves ganks
+    "Shaco":     {"pre6": 20, "post6": 20},
+    "Evelynn":   {"pre6": 0,  "post6": 25},  # needs level 6 for charm
+    "Rengar":    {"pre6": 10, "post6": 25},  # ult makes every gank lethal
+    "Graves":    {"pre6": 5,  "post6": 8},   # prefers farming
+    "Master Yi": {"pre6": 0,  "post6": 5},   # Yi doesn't gank well
+    "Karthus":   {"pre6": 0,  "post6": 0},
 }
+
+# ── Recall thresholds ────────────────────────
+RECALL_HP_CRITICAL = 22   # RECALL NOW – back immediately
+RECALL_HP_LOW      = 32   # RECALL NOW – finish this camp then back
+RECALL_HP_SOFT     = 48   # Back if also have buyable gold
+RECALL_HP_MEDIUM   = 62   # Soft suggestion if gold is tempting
+
+# Gold tiers: (minimum_gold, item_label)
+# "RECALL NOW → 1320g (Serrated Dirk)" style messages
+RECALL_GOLD_TIERS = [
+    (3200, "full item ready"),
+    (1600, "Brutalizer / component set"),
+    (1300, "Serrated Dirk or Phage"),
+    (800,  "Long Sword x2 + pots"),
+    (600,  "component + pots"),
+]
+# Force recall regardless of HP when gold hits this (item complete)
+RECALL_GOLD_FORCE = 3200
 
 # ── Objective timers (minutes) ───────────────
 DRAGON_FIRST_SPAWN   = 5.0

@@ -19,6 +19,7 @@ import api_client
 import config
 from jungler_tracker import JunglerTracker
 from gank_advisor import GankAdvisor, LaneState
+from pathing_advisor import PathingAdvisor
 
 # Role string → lane label mapping from the Live Client API
 _ROLE_TO_LANE = {
@@ -45,8 +46,9 @@ class DecisionEngine:
         self.overlay_cb = overlay_cb
         self.chat_cb    = chat_cb
 
-        self.jg_tracker = JunglerTracker()
-        self.gank_advisor = GankAdvisor()
+        self.jg_tracker     = JunglerTracker()
+        self.gank_advisor   = GankAdvisor()
+        self.pathing        = PathingAdvisor()
 
         # State
         self.game_time:    float = 0.0
@@ -54,6 +56,7 @@ class DecisionEngine:
         self.my_champion:  str   = ""
         self.my_level:     int   = 1
         self.my_hp:        float = 100.0
+        self.my_gold:      float = 0.0
         self.my_team:      str   = ""
 
         # Dragon / baron kill tracking  (game_time of last kill)
@@ -66,9 +69,12 @@ class DecisionEngine:
         self._last_chat_side:    str   = ""
 
         # Overlay de-duplication: only emit a message if it changed
-        self._last_jg_msg:   str = ""
-        self._last_gank_msg: str = ""
-        self._last_obj_msg:  str = ""
+        self._last_jg_msg:     str = ""
+        self._last_gank_msg:   str = ""
+        self._last_obj_msg:    str = ""
+        self._last_path_msg:    str  = ""
+        self._last_recall_msg:  str  = ""
+        self._enemy_champs:     list = []   # populated once enemy team is known
 
     # ── Main tick ───────────────────────────────────────────────────────────
 
@@ -86,8 +92,11 @@ class DecisionEngine:
             self._update_minimap(minimap_tracker)
 
         output: List[Tuple[str, str]] = []
+        # Priority order: recall > jungler awareness > gank > pathing > objectives
+        self._emit_recall(output)
         self._emit_jungler(output)
         self._emit_gank(data, output)
+        self._emit_pathing(output)
         self._emit_objectives(data, output)
         self._maybe_chat()
 
@@ -106,6 +115,7 @@ class DecisionEngine:
 
         active = data.get("activePlayer", {})
         self.my_summoner = active.get("summonerName", self.my_summoner)
+        self.my_gold     = active.get("currentGold", self.my_gold)
 
         player_list = data.get("allPlayers", [])
 
@@ -116,15 +126,27 @@ class DecisionEngine:
         # Refresh enemy jungler stats
         self.jg_tracker.update_stats(player_list)
 
-        # Refresh my own stats
+        # Refresh my own stats + cache enemy champion names
         for p in player_list:
             if p.get("summonerName") == self.my_summoner:
-                self.my_champion = p.get("championName", self.my_champion)
-                self.my_level    = p.get("level", self.my_level)
-                self.my_hp       = api_client.hp_percent(p)
-                self.my_team     = p.get("team", self.my_team)
-                self.gank_advisor.champion = self.my_champion
+                new_champ = p.get("championName", self.my_champion)
+                if new_champ != self.my_champion:
+                    self.my_champion = new_champ
+                    self.gank_advisor.champion  = new_champ
+                    self.pathing.update_champion(new_champ)
+                self.my_level = p.get("level", self.my_level)
+                self.my_hp    = api_client.hp_percent(p)
+                self.my_team  = p.get("team", self.my_team)
                 break
+
+        # Cache enemy champion names once (used for Kayn form hint)
+        if not self._enemy_champs and self.my_team and player_list:
+            enemy_team = "CHAOS" if self.my_team == "ORDER" else "ORDER"
+            self._enemy_champs = [
+                p.get("championName", "")
+                for p in player_list
+                if p.get("team") == enemy_team
+            ]
 
         # Parse objective events
         for event in data.get("events", {}).get("Events", []):
@@ -178,6 +200,41 @@ class DecisionEngine:
         if msg and msg != self._last_obj_msg:
             output.append((f"{self._ts()} {msg}", "warn"))
             self._last_obj_msg = msg
+
+    def _emit_recall(self, output: List[Tuple[str, str]]):
+        """Highest priority – recall recommendation from pathing advisor."""
+        result = self.pathing.recall_check(self.my_hp, self.my_gold, self.game_time)
+        if result:
+            msg, lvl = result
+            tagged = f"{self._ts()} {msg}"
+            # Always re-emit RECALL NOW so it stays visible until condition clears
+            if "RECALL NOW" in msg or tagged != self._last_recall_msg:
+                output.append((tagged, lvl))
+                self._last_recall_msg = tagged
+        else:
+            # Condition cleared – reset so it re-fires if HP drops again
+            self._last_recall_msg = ""
+
+    def _emit_pathing(self, output: List[Tuple[str, str]]):
+        """Pathing suggestion (shown when no recall is active)."""
+        # Suppress pathing advice while a recall is screaming at the player
+        if self._last_recall_msg and "RECALL NOW" in self._last_recall_msg:
+            return
+
+        enemy_jg_side = self.jg_tracker.enemy.last_seen_side or "unknown"
+        # Pass enemy comp for Kayn form hint (champion names of enemy team)
+        enemy_comp = self._enemy_champ_names()
+        msg, lvl = self.pathing.suggest(
+            self.game_time, self.my_level, enemy_jg_side, self.my_hp, enemy_comp
+        )
+        tagged = f"{self._ts()} {msg}"
+        if tagged != self._last_path_msg:
+            output.append((tagged, lvl))
+            self._last_path_msg = tagged
+
+    def _enemy_champ_names(self) -> list:
+        """Return cached enemy champion names (populated during _ingest)."""
+        return self._enemy_champs
 
     # ── Chat ────────────────────────────────────────────────────────────────
 
