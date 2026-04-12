@@ -1,112 +1,121 @@
 """
-League Decision Advisor – entry point.
+League Advisor – entry point.
 
-Usage
------
-    python main.py
+Starts four logical threads:
+  1. API thread        – polls Riot Live Client API every 1.5s
+  2. Minimap thread    – captures and analyses minimap every 0.5s
+  3. Decision thread   – scores all actions every 0.8s, writes to overlay queue
+  4. Overlay (main)    – tkinter UI, polls queue every 300ms (must run on main thread)
 
-The script waits for a League game to start (the Live Client API becomes
-available), then runs the advisor loop until Ctrl-C or the game ends.
+The engine / minimap threads are daemon threads so they die with the process
+when the user closes the overlay window.
 
-Architecture
-------------
-  main thread   – keeps Python alive and handles shutdown signals
-  overlay thread – daemon thread running the tkinter window
-  engine loop   – driven by the main thread via time.sleep polling
+Usage:
+    python main.py [--calibrate]
+
+    --calibrate   Run the minimap calibration tool instead of starting the advisor.
 """
 
-import signal
+from __future__ import annotations
+
+import argparse
+import queue
 import sys
+import threading
 import time
 
-import api_client
 import config
-from chat_auto import ChatAuto
-from decision_engine import DecisionEngine
-from minimap_tracker import MinimapTracker
-from overlay import Overlay
+from engine.decision_engine import DecisionEngine
+from voice.tts import TTS
+from ui.overlay import Overlay
 
 
-# ── Boot banner ──────────────────────────────────────────────────────────────
+def main() -> None:
+    parser = argparse.ArgumentParser(description="League Advisor")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Run minimap calibration tool")
+    parser.add_argument("--no-voice", action="store_true",
+                        help="Disable TTS voice output")
+    args = parser.parse_args()
 
-BANNER = r"""
-  ╔══════════════════════════════════════╗
-  ║      League Decision Advisor         ║
-  ║  Enemy JG · Gank · Objectives · HUD  ║
-  ╚══════════════════════════════════════╝
-"""
+    if args.calibrate:
+        from ui.calibrate import run_calibration
+        run_calibration()
+        return
 
+    if args.no_voice:
+        config.TTS_ENABLED = False
 
-def main():
-    print(BANNER)
+    print("[LeagueAdvisor] Starting…  (waiting for a game to be active)")
 
-    # ── Wait for League to start ─────────────────────────────────────────────
-    print("Waiting for a game to start (Live Client API)…")
-    print("  → Start a League match, this will auto-connect.")
-    print("  → Press Ctrl-C to quit.\n")
+    # ── Shared queue: decision → overlay ─────────────────────────────────────
+    overlay_queue: queue.Queue = queue.Queue(maxsize=50)
 
-    while True:
-        if api_client.is_game_running():
-            break
-        try:
-            time.sleep(3)
-        except KeyboardInterrupt:
-            print("\nExiting.")
-            sys.exit(0)
+    # ── TTS ───────────────────────────────────────────────────────────────────
+    tts = TTS()
 
-    print("Game detected!  Starting advisor…\n")
+    # ── Decision engine (starts API + decision threads internally) ────────────
+    engine = DecisionEngine()
+    engine.set_tts(tts)
+    engine.start(overlay_queue)
 
-    # ── Initialise components ────────────────────────────────────────────────
-    overlay  = Overlay()
-    chat     = ChatAuto()
-    minimap  = MinimapTracker()
-
-    engine = DecisionEngine(
-        overlay_cb=overlay.add_message,
-        chat_cb=chat.send,
+    # ── Minimap thread ────────────────────────────────────────────────────────
+    minimap_thread = threading.Thread(
+        target=_minimap_loop,
+        args=(engine,),
+        name="Minimap-thread",
+        daemon=True,
     )
+    minimap_thread.start()
 
-    # ── Start overlay ────────────────────────────────────────────────────────
-    overlay.start()
-    time.sleep(0.6)   # let the window render
+    # ── Wait for game to become active before showing overlay ─────────────────
+    _wait_for_game(engine)
+    print("[LeagueAdvisor] Game detected!  Opening overlay…")
 
-    overlay.add_message("◈ Advisor active", "info")
-    overlay.add_message("Identifying enemy jungler…", "dim")
-    if not chat.is_available:
-        overlay.add_message("Auto-chat OFF (install pyautogui)", "dim")
+    # ── Overlay (blocks main thread) ──────────────────────────────────────────
+    overlay = Overlay(overlay_queue)
+    overlay.run()
 
-    # ── Graceful shutdown on Ctrl-C / SIGTERM ────────────────────────────────
-    def _shutdown(sig=None, frame=None):
-        print("\nShutting down…")
-        overlay.add_message("Advisor stopped.", "dim")
-        time.sleep(0.8)
-        overlay.stop()
-        sys.exit(0)
+    # Cleanup
+    engine.stop()
+    print("[LeagueAdvisor] Overlay closed.  Exiting.")
 
-    signal.signal(signal.SIGINT,  _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
 
-    print("Advisor running.  Ctrl-C to stop.\n")
+# ---------------------------------------------------------------------------
+# Minimap polling loop
+# ---------------------------------------------------------------------------
 
-    # ── Main loop ────────────────────────────────────────────────────────────
-    consecutive_failures = 0
+def _minimap_loop(engine: DecisionEngine) -> None:
+    """Capture minimap, detect dots, push into GameState."""
+    from vision.minimap_reader import MinimapReader
 
+    reader = MinimapReader()
     while True:
         try:
-            engine.tick(minimap_tracker=minimap)
-            consecutive_failures = 0
+            _, dots = reader.get_snapshot()
+            engine.state.update_minimap(dots)
+        except Exception:
+            pass
+        time.sleep(config.POLL_MINIMAP_INTERVAL)
 
-        except KeyboardInterrupt:
-            _shutdown()
 
-        except Exception as exc:
-            consecutive_failures += 1
-            print(f"[Engine error #{consecutive_failures}] {exc}")
-            if consecutive_failures >= 10:
-                overlay.add_message("API error – is the game still running?", "warn")
-                consecutive_failures = 0
+# ---------------------------------------------------------------------------
+# Wait helper
+# ---------------------------------------------------------------------------
 
-        time.sleep(config.POLL_INTERVAL)
+def _wait_for_game(engine: DecisionEngine, timeout: float = 600) -> None:
+    """Block until the game API responds or timeout (default 10 min)."""
+    start = time.monotonic()
+    dots = 0
+    while not engine.is_game_active():
+        elapsed = time.monotonic() - start
+        if elapsed > timeout:
+            print("\n[LeagueAdvisor] Timed out waiting for game.  Exiting.")
+            sys.exit(1)
+        dots = (dots + 1) % 4
+        print(f"\r[LeagueAdvisor] Waiting for game{'.' * dots}   ", end="", flush=True)
+        time.sleep(2)
+    print()
 
 
 if __name__ == "__main__":
