@@ -8,13 +8,13 @@ API_BASE    = "https://127.0.0.1:2999"
 API_TIMEOUT = 2.0   # seconds per HTTP request
 
 # ── Poll intervals (seconds) ──────────────────────────────────────────────────
-POLL_API_INTERVAL      = 1.5   # game state / HP / gold
+POLL_API_INTERVAL      = 1.0   # game state / HP / gold
 POLL_MINIMAP_INTERVAL  = 0.5   # screen capture + dot detection
 OVERLAY_REFRESH_MS     = 300   # tkinter label refresh
 
 # Aliases used internally by engine modules
 API_POLL_INTERVAL  = POLL_API_INTERVAL
-DECISION_INTERVAL  = 0.8   # how often the decision engine ticks
+DECISION_INTERVAL  = 0.4   # how often the decision engine ticks
 
 # TTS minimum action score before voice fires
 TTS_MIN_SCORE = 50
@@ -82,6 +82,7 @@ SCORE_OBJECTIVE_CLOSE     = 50    # objective spawning within 60s
 GANK_BLOCK_MY_HP_PCT      = 25    # I'm too low to gank
 GANK_BLOCK_TARGET_HP_PCT  = 5     # Target is essentially dead already
 GANK_MIN_FINAL_SCORE      = 38    # Score must beat this to surface the rec
+GANK_JG_NEARBY_SECONDS    = 15    # Enemy JG seen within this many seconds → danger
 
 # ── Recall logic ─────────────────────────────────────────────────────────────
 RECALL_HP_CRITICAL  = 22    # RECALL NOW immediately

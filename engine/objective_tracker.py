@@ -128,13 +128,21 @@ class ObjectiveTracker:
         return None
 
     def is_objective_imminent(self, game_time: float, window_s: float = 45.0) -> bool:
-        """Return True if any major objective spawns within window_s seconds."""
-        if self.time_until_dragon(game_time) <= window_s:
+        """
+        Return True if any major objective is about to SPAWN within window_s seconds.
+
+        Only fires when the objective is approaching its spawn — NOT when it has
+        already been alive in the pit.  Once dragon/baron is already up, ganks
+        that lead into the fight are still valid plays.
+        """
+        t_drag = self.time_until_dragon(game_time)
+        if 0 < t_drag <= window_s:
             return True
         if game_time >= (config.BARON_FIRST_SPAWN - 1) * 60:
-            if self.time_until_baron(game_time) <= window_s:
+            t_bar = self.time_until_baron(game_time)
+            if 0 < t_bar <= window_s:
                 return True
         t_her = self.time_until_herald(game_time)
-        if t_her is not None and t_her <= window_s:
+        if t_her is not None and 0 < t_her <= window_s:
             return True
         return False

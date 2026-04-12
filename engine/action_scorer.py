@@ -261,37 +261,56 @@ class ActionScorer:
         # ── Score calculation ────────────────────────────────────────────────
         score = config.SCORE_GANK_BASE
 
-        # HP factor
+        # HP factor — single most important gank signal
         if hp <= config.SCORE_ENEMY_LOW_HP_THRESH:
             score += config.SCORE_ENEMY_LOW_HP
         elif hp <= config.SCORE_ENEMY_MED_HP_THRESH:
             score += config.SCORE_ENEMY_MED_HP
 
-        # Extended (past river line)
-        if best_target.last_minimap_pos:
+        # Extended (past river line) — minimap-confirmed only
+        is_extended_flag = False
+        if best_target.last_minimap_pos and not best_target.zone_inferred:
             mx, my = best_target.last_minimap_pos
             enemy_team = best_target.team
             my_team    = "ORDER" if enemy_team == "CHAOS" else "CHAOS"
             if is_extended(mx, my, best_target.role, my_team):
                 score += config.SCORE_EXTENDED
+                is_extended_flag = True
 
-        # Enemy jungler away from this side
+        # Level advantage — real players always consider this
+        level_diff = me.level - best_target.level
+        if level_diff >= 2:
+            score += 12   # significant level lead → easier kill
+        elif level_diff >= 1:
+            score += 6
+        elif level_diff <= -2:
+            score -= 10   # they outscale us at this level
+
+        # Early game aggression window (levels 1-6 are volatile)
+        mins = game_time / 60.0
+        if mins < 8:
+            score += 8   # early game ganks have highest kill potential
+
+        # Enemy jungler away from this side → safe window
         safe = jg_tracker.safe_side()
         if safe == lane:
-            score += config.SCORE_JG_FAR   # JG is confirmed other side
+            score += config.SCORE_JG_FAR
 
-        # Enemy jungler nearby this side
+        # Enemy jungler recently seen on this side → danger
         threat = jg_tracker.threat_side()
         if threat == lane:
             elapsed = jg_tracker.enemy.age(game_time)
-            if elapsed < config.GANK_JG_NEARBY_SECONDS if hasattr(config, 'GANK_JG_NEARBY_SECONDS') else 15:
+            if elapsed < 15:
                 score += config.SCORE_JG_NEARBY_PENALTY
 
-        # My confidence in target position
+        # Position confidence penalty — stale minimap data
         if best_target.visibility == Visibility.STALE:
             score += config.SCORE_NO_VISION_PENALTY
+        # API-inferred zone (not minimap-confirmed) — small penalty
+        if best_target.zone_inferred:
+            score -= 8   # we're less certain of their exact position
 
-        # Objective penalty: don't gank if objective very close
+        # Objective penalty: don't gank when objective is about to spawn
         if obj_tracker.is_objective_imminent(game_time, 35.0):
             score -= 30
 
@@ -300,14 +319,15 @@ class ActionScorer:
             return None
 
         # ── Build output ─────────────────────────────────────────────────────
-        hp_str     = f"{int(hp)}% HP"
-        zone_str   = best_target.last_zone.replace("_", " ")
-        conf_str   = "visible" if best_target.visibility == Visibility.VISIBLE else "seen"
-        ext_str    = ", extended" if score > config.SCORE_GANK_BASE + config.SCORE_EXTENDED else ""
-        reason     = f"{best_target.champion} {hp_str}, {conf_str} {zone_str}{ext_str}"
+        hp_str    = f"{int(hp)}%"
+        zone_str  = best_target.last_zone.replace("_", " ")
+        inferred  = " (est.)" if best_target.zone_inferred else ""
+        ext_str   = ", extended" if is_extended_flag else ""
+        lvl_str   = f" Lv{best_target.level}" if best_target.level > 1 else ""
+        reason    = f"{best_target.champion}{lvl_str} {hp_str} HP, {zone_str}{inferred}{ext_str}"
 
         is_critical = score >= 65
-        lvl = "critical" if is_critical else "warn"
+        lvl    = "critical" if is_critical else "warn"
         prefix = "GANK" if is_critical else "Gank"
 
         return ActionResult(

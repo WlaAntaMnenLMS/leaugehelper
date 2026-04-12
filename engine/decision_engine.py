@@ -26,6 +26,7 @@ from engine.game_state import GameState
 from engine.objective_tracker import ObjectiveTracker
 from engine.action_scorer import ActionScorer
 from engine.pathing import PathingAdvisor
+from build.recommender import BuildRecommender
 
 
 class DecisionEngine:
@@ -40,10 +41,11 @@ class DecisionEngine:
     """
 
     def __init__(self):
-        self.state           = GameState()
-        self.obj_tracker     = ObjectiveTracker()
-        self.pathing_advisor = PathingAdvisor()
-        self.scorer          = ActionScorer()
+        self.state            = GameState()
+        self.obj_tracker      = ObjectiveTracker()
+        self.pathing_advisor  = PathingAdvisor()
+        self.scorer           = ActionScorer()
+        self.build_recommender = BuildRecommender()
 
         # Slot queue: dict updates pushed to the overlay
         # Each item is a dict: {"slot": str, "label": str, "reason": str, "level": str}
@@ -170,11 +172,16 @@ class DecisionEngine:
             )
 
         # ── Build slot ────────────────────────────────────────────────────────
+        # Champion module takes priority; fall back to generic recommender
+        build_hint = None
         if self._champion_module and hasattr(self._champion_module, "build_hint"):
             with self.state.lock:
-                hint = self._champion_module.build_hint(me, enemies, game_time)
-            if hint:
-                self._push_slot("BUILD", hint, "", "info")
+                build_hint = self._champion_module.build_hint(me, enemies, game_time)
+        if not build_hint:
+            with self.state.lock:
+                build_hint = self.build_recommender.get_hint(me, enemies, game_time)
+        if build_hint:
+            self._push_slot("BUILD", build_hint, "", "info")
 
         # ── Recall hint ───────────────────────────────────────────────────────
         recall_hint = self.obj_tracker.recall_before_objective(game_time)

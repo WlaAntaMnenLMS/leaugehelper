@@ -30,6 +30,20 @@ import config
 
 
 # ---------------------------------------------------------------------------
+# Role → default zone mapping (used when we have no minimap data)
+# Real players assume a laner is in their lane until proven otherwise.
+# ---------------------------------------------------------------------------
+
+_ROLE_DEFAULT_ZONE = {
+    "TOP":     "top_lane",
+    "MIDDLE":  "mid_lane",
+    "BOTTOM":  "bot_lane",
+    "UTILITY": "bot_lane",
+    "JUNGLE":  "top_jungle",   # rough starting-side guess
+}
+
+
+# ---------------------------------------------------------------------------
 # Enumerations
 # ---------------------------------------------------------------------------
 
@@ -83,9 +97,15 @@ class TrackedTarget:
     zone_confidence:   float = 0.0         # 0-1 confidence in zone assignment
     last_seen_game_time: float = 0.0       # game-clock seconds when minimap dot seen
 
-    # Timestamp of the last VALID HP reading (only valid when target was visible)
+    # Timestamp of the last VALID HP reading
     last_valid_hp_game_time: float = 0.0
     last_valid_hp_value:     Optional[float] = None  # stored as percent 0-100
+
+    # Timestamp of the last API update (real-time HP from Riot is always valid)
+    last_api_update_time: float = 0.0
+
+    # Whether zone was inferred from API role rather than confirmed by minimap
+    zone_inferred: bool = False
 
     # Visibility and position confidence
     visibility:           Visibility = Visibility.UNKNOWN
@@ -109,23 +129,33 @@ class TrackedTarget:
         """
         Return HP percent ONLY when it can be trusted for gank decisions.
 
-        Rules:
-          - If target is currently VISIBLE → use live hp_percent.
-          - If target was recently visible AND HP reading is < HP_VALIDITY_S old
-            → use stored reading.
-          - Otherwise → return None (HP unknown, cannot use for gank).
+        The Riot Live Client API provides real-time HP for ALL players,
+        including fog-of-war enemies.  This is intentional by Riot for
+        overlay tools.  So API HP is always valid as long as the poll is fresh.
 
-        This prevents the old bug of showing "0% HP" for targets that are
-        dead or have stale/invalid readings.
+        Priority order:
+          1. Currently VISIBLE on minimap → use live hp_percent
+          2. Fresh API data (< HP_VALIDITY_S since last poll) → use current hp_percent
+          3. Recently stored reading (< HP_VALIDITY_S) → use stored value
+          4. None → cannot score gank
         """
         if self.is_dead:
-            return None   # dead targets are not gank candidates
+            return None
+
+        hp = self.hp_percent
+        if hp <= 0:
+            return None
 
         if self.visibility == Visibility.VISIBLE:
-            hp = self.hp_percent
-            return hp if hp > 0 else None
+            return hp
 
-        age_s = (current_game_time - self.last_valid_hp_game_time)
+        # Riot API gives real-time HP — use it while the poll is fresh
+        api_age = current_game_time - self.last_api_update_time
+        if self.last_api_update_time > 0 and api_age < config.HP_VALIDITY_S:
+            return hp
+
+        # Fallback: stored reading from last confirmed sighting
+        age_s = current_game_time - self.last_valid_hp_game_time
         if (
             self.last_valid_hp_value is not None
             and age_s < config.HP_VALIDITY_S
@@ -133,7 +163,7 @@ class TrackedTarget:
         ):
             return self.last_valid_hp_value
 
-        return None   # HP is too stale – do not use for gank decision
+        return None
 
     # ── Position helpers ─────────────────────────────────────────────────────
 
@@ -147,30 +177,49 @@ class TrackedTarget:
         """
         Decay position confidence based on time elapsed since last sighting.
         Must be called every engine tick before making recommendations.
+
+        Two confidence tracks:
+          Minimap-confirmed: decays from 1.0 → 0.05 over TARGET_EXPIRED_S
+          API-inferred only: stays at 0.65 as long as fresh API data exists,
+                             then drops to 0.40 (stale role assumption)
         """
         if self.is_dead:
             self.visibility          = Visibility.DEAD
             self.position_confidence = 0.0
             return
 
-        elapsed = self.age(current_game_time)
-
         if self.visibility == Visibility.VISIBLE:
-            # Was visible last tick – stays high until minimap no longer shows dot
             self.position_confidence = 1.0
             return
 
+        elapsed = self.age(current_game_time)  # time since last minimap sighting
+
+        # No minimap sighting ever — use API-based confidence
+        if self.last_seen_game_time <= 0:
+            api_age = current_game_time - self.last_api_update_time
+            if self.last_api_update_time > 0 and api_age < config.API_POLL_INTERVAL * 4:
+                # Fresh API data: moderately confident they're in their lane zone
+                self.visibility          = Visibility.RECENTLY_SEEN
+                self.position_confidence = 0.65
+            elif self.last_api_update_time > 0:
+                # Stale API data: lower confidence but don't zero out
+                self.visibility          = Visibility.STALE
+                self.position_confidence = 0.40
+            else:
+                self.visibility          = Visibility.UNKNOWN
+                self.position_confidence = 0.0
+            return
+
+        # Minimap-based decay schedule
         if elapsed <= config.TARGET_RECENTLY_SEEN_S:
             self.visibility          = Visibility.RECENTLY_SEEN
             self.position_confidence = 0.90
         elif elapsed <= config.TARGET_STALE_S:
-            # Linear decay from 0.90 → 0.35 over the stale window
             t   = elapsed - config.TARGET_RECENTLY_SEEN_S
             rng = config.TARGET_STALE_S - config.TARGET_RECENTLY_SEEN_S
             self.visibility          = Visibility.RECENTLY_SEEN if elapsed < 20 else Visibility.STALE
             self.position_confidence = max(0.35, 0.90 - (t / rng) * 0.55)
         elif elapsed <= config.TARGET_EXPIRED_S:
-            # Decay from 0.35 → 0.08
             t   = elapsed - config.TARGET_STALE_S
             rng = config.TARGET_EXPIRED_S - config.TARGET_STALE_S
             self.visibility          = Visibility.STALE
@@ -183,29 +232,29 @@ class TrackedTarget:
 
     def is_valid_gank_target(self, current_game_time: float) -> bool:
         """
-        Hard gate – returns True ONLY when enough evidence exists to even
-        consider a gank.  False means DO NOT recommend a gank for this target.
+        Hard gate for gank recommendations.
 
         Conditions required:
           1. Not dead.
           2. Position confidence above GANK_MIN_CONFIDENCE.
-          3. Last seen in a lane zone (not base, not jungle roaming unknown).
-          4. Valid HP exists (not 0, not stale beyond HP_VALIDITY_S).
+             (API-inferred zone gives 0.65; minimap-confirmed gives 0.90+)
+          3. Last zone is a lane zone (not base, not unknown).
+          4. Valid HP exists — either via fresh API data or recent sighting.
         """
         if self.is_dead:
             return False
-        if self.visibility in (Visibility.DEAD, Visibility.UNKNOWN):
+        if self.visibility == Visibility.DEAD:
             return False
         if self.position_confidence < config.GANK_MIN_CONFIDENCE:
             return False
-        # Must be seen in a lane-type zone (not their base or unknown)
+        # Must be in a lane-type zone (base or unknown = no gank)
         if self.last_zone in ("unknown", "blue_base", "red_base"):
             return False
         hp = self.get_valid_hp_for_gank(current_game_time)
         if hp is None:
-            return False   # No valid HP – can't assess kill potential
+            return False
         if hp <= config.GANK_BLOCK_TARGET_HP_PCT:
-            return False   # Essentially dead already, no point
+            return False
         return True
 
     # ── API update ───────────────────────────────────────────────────────────
@@ -214,30 +263,55 @@ class TrackedTarget:
         """
         Ingest fresh data from the allPlayers API response.
         Called every API poll regardless of visibility.
+
+        The Riot API provides real-time HP for all players (fog of war included).
+        We always record HP here so gank scoring has valid data even without
+        minimap detection.
+
+        Zone inference: if we have never seen this target on the minimap, we
+        infer their zone from their role ("they're probably in their lane").
+        This gives a confidence of 0.65 — enough to generate gank candidates.
+        A minimap sighting immediately overrides this with real position data.
         """
-        from api.live_client import hp_percent as _hp_pct, is_player_dead
+        from api.live_client import is_player_dead
 
         self.current_hp = player_dict.get("currentHealth", self.current_hp)
         self.max_hp     = max(1.0, player_dict.get("maxHealth", self.max_hp))
         self.level      = player_dict.get("level", self.level)
+        self.last_api_update_time = current_game_time
 
-        # A player is dead if HP <= 0 (the API returns 0 when dead)
+        # Death / respawn detection
         new_dead = is_player_dead(player_dict) or self.current_hp <= 0
         if new_dead and not self.is_dead:
             self.is_dead    = True
             self.visibility = Visibility.DEAD
-        elif not new_dead and self.is_dead:
-            # Respawned
-            self.is_dead   = False
-            self.visibility = Visibility.UNKNOWN
             self.position_confidence = 0.0
+            return
+        elif not new_dead and self.is_dead:
+            # Respawned — back to base, zone inference will re-apply
+            self.is_dead             = False
+            self.visibility          = Visibility.UNKNOWN
+            self.position_confidence = 0.0
+            self.last_zone           = "unknown"
+            self.zone_inferred       = False
 
-        # Record valid HP while visible (for fresh gank advice after losing sight)
-        if self.visibility == Visibility.VISIBLE and not self.is_dead:
-            hp = self.hp_percent
-            if hp > 0:
-                self.last_valid_hp_value        = hp
-                self.last_valid_hp_game_time    = current_game_time
+        # Always record fresh HP (Riot API HP is real-time)
+        hp = self.hp_percent
+        if hp > 0 and not self.is_dead:
+            self.last_valid_hp_value     = hp
+            self.last_valid_hp_game_time = current_game_time
+
+        # Zone inference: assign a lane zone from role when we have no minimap data.
+        # This makes gank scoring work even when minimap detection isn't running.
+        if self.last_zone == "unknown" and self.role:
+            inferred = _ROLE_DEFAULT_ZONE.get(self.role)
+            if inferred:
+                self.last_zone           = inferred
+                self.zone_inferred       = True
+                # Only set confidence if not already established
+                if self.visibility == Visibility.UNKNOWN:
+                    self.visibility          = Visibility.RECENTLY_SEEN
+                    self.position_confidence = 0.65  # API-inferred, enough for ganks
 
     # ── Minimap update ───────────────────────────────────────────────────────
 
