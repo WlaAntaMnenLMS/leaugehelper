@@ -106,7 +106,19 @@ def hp_percent(player: dict) -> float:
 
 
 def is_player_dead(player: dict) -> bool:
-    """True if the player has 0 or negative current health in the snapshot."""
+    """
+    True if the player is confirmed dead.
+
+    The Riot API signals death via three fields — we check all three because
+    different game versions prioritise different fields.
+    """
+    # Most reliable: explicit isDead flag
+    if player.get("isDead", False):
+        return True
+    # respawnTimer > 0 means waiting to respawn → dead
+    if player.get("respawnTimer", 0) > 0.1:
+        return True
+    # Fallback: zero health
     return player.get("currentHealth", 1) <= 0
 
 

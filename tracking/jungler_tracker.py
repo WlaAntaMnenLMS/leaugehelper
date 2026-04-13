@@ -46,6 +46,10 @@ class JunglerTracker:
         """
         Scan the player list for Smite holders.  Sets self.enemy and self.ally.
         Returns True once identification is complete.
+
+        Identification is 100% API-based (champion name + Smite spell).
+        The system does NOT try to identify champions visually from the minimap —
+        minimap detection only provides position dots, not champion icons.
         """
         if self._identified and self.enemy.champion:
             return True
@@ -54,9 +58,17 @@ class JunglerTracker:
 
         from api.live_client import has_smite, get_team, get_role
 
+        def _name_matches(p: dict) -> bool:
+            """Match player against my summoner name, handling Riot ID format."""
+            return (
+                p.get("summonerName", "") == my_summoner
+                or p.get("riotIdGameName", "") == my_summoner
+                or p.get("summonerName", "").split("#")[0] == my_summoner.split("#")[0]
+            )
+
         # Find my team
         for p in player_list:
-            if p.get("summonerName") == my_summoner:
+            if _name_matches(p):
                 self._my_team = get_team(p)
                 break
         if not self._my_team:
@@ -158,7 +170,8 @@ class JunglerTracker:
         if not e.champion:
             return "Identifying junglers…", "dim"
         if e.is_dead:
-            return f"{e.champion} is dead", "dim"
+            # Dead jungler = free map — this is actionable, show it prominently
+            return f"{e.champion} DEAD – FREE MAP!", "warn"
 
         e.update_confidence(game_time)
         name    = e.champion
@@ -170,16 +183,16 @@ class JunglerTracker:
 
         if elapsed < config.JG_AWARE_S:
             zone = e.last_zone.replace("_", " ")
-            return f"{name} {zone}  ({int(elapsed)}s ago)", "info"
+            return f"{name} {zone}  ({int(elapsed)}s)", "info"
 
         if elapsed < config.JG_WARN_S:
             zone = e.last_zone.replace("_", " ")
-            return f"{name} missing {int(elapsed)}s  [{zone}]", "warn"
+            return f"{name} MIA {int(elapsed)}s  [{zone}]", "warn"
 
         if elapsed < config.JG_DANGER_S:
             return f"{name} MIA {int(elapsed)}s  → PLAY SAFE", "critical"
 
-        return f"{name} MIA {int(elapsed)}s  → ward & be careful", "critical"
+        return f"{name} MIA {int(elapsed)}s  → WARD UP", "critical"
 
     def safe_side(self) -> Optional[str]:
         """

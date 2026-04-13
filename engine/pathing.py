@@ -118,18 +118,27 @@ class PathingAdvisor:
         t_baron = obj_tracker.time_until_baron(game_time)
         t_her   = obj_tracker.time_until_herald(game_time)
 
-        # ── Objective imminent ────────────────────────────────────────────────
+        # ── Objective already alive in pit → take it now ─────────────────────
+        # (t == 0 means spawned but not yet taken; 0 < t means about to spawn)
+        if t_drag == 0.0:
+            return ["Dragon pit – contest now"]
+        if t_her is not None and t_her == 0.0:
+            return ["Take Herald now"]
+        if game_time >= (config.BARON_FIRST_SPAWN - 1) * 60 and t_baron == 0.0:
+            return ["Baron pit – contest now"]
+
+        # ── Objective about to spawn (within 30s) ─────────────────────────────
         next_obj = self._next_objective_name(obj_tracker, game_time)
 
-        if t_drag <= 30 or t_baron <= 30 or (t_her is not None and t_her <= 30):
+        if 0 < t_drag <= 30 or 0 < t_baron <= 30 or (t_her is not None and 0 < t_her <= 30):
             return [f"Path to {next_obj}"]
 
-        if t_drag <= 90 or t_baron <= 90 or (t_her is not None and t_her <= 90):
+        if 0 < t_drag <= 90 or 0 < t_baron <= 90 or (t_her is not None and 0 < t_her <= 90):
             # Clear one nearby camp then path
             camp = self._nearest_available_camp(me_zone, game_time)
             if camp:
                 result.append(camp)
-            result.append(f"Then path {next_obj}")
+            result.append(f"→ {next_obj}")
             return result
 
         # ── Normal pathing ────────────────────────────────────────────────────
@@ -175,16 +184,22 @@ class PathingAdvisor:
         return None
 
     def _next_objective_name(self, obj_tracker, game_time: float) -> str:
+        """Return the name of the next objective to SPAWN (t > 0 only)."""
         t_drag  = obj_tracker.time_until_dragon(game_time)
         t_baron = obj_tracker.time_until_baron(game_time)
         t_her   = obj_tracker.time_until_herald(game_time)
 
-        candidates = [("Dragon", t_drag)]
-        if game_time >= (config.BARON_FIRST_SPAWN - 1) * 60:
+        # Only include objectives that haven't spawned yet (t > 0)
+        candidates = []
+        if t_drag > 0:
+            candidates.append(("Dragon", t_drag))
+        if game_time >= (config.BARON_FIRST_SPAWN - 1) * 60 and t_baron > 0:
             candidates.append(("Baron", t_baron))
-        if t_her is not None:
+        if t_her is not None and t_her > 0:
             candidates.append(("Herald", t_her))
 
+        if not candidates:
+            return "Dragon"   # fallback
         return min(candidates, key=lambda x: x[1])[0]
 
     def pathing_label(

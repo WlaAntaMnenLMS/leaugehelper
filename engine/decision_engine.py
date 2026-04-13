@@ -119,15 +119,19 @@ class DecisionEngine:
             time.sleep(config.DECISION_INTERVAL)
 
     def _tick(self) -> None:
+        # Copy all state out of the lock immediately — never score/compute inside lock
         with self.state.lock:
             if self.state.game_time < 1.0:
-                return   # No game data yet
-
-            me         = self.state.me
-            enemies    = dict(self.state.enemies)
+                return
+            import copy
+            me         = copy.copy(self.state.me)
+            enemies    = {k: v for k, v in self.state.enemies.items()}
             jg_tracker = self.state.jg_tracker
             game_time  = self.state.game_time
+            me_zone    = jg_tracker.ally.last_zone or "unknown"
+            jg_safe    = jg_tracker.safe_side()
 
+        # All scoring/rendering now happens outside the lock
         # ── Score actions ─────────────────────────────────────────────────────
         self.scorer.champion_module = self._champion_module
         results = self.scorer.score_all(
@@ -145,9 +149,6 @@ class DecisionEngine:
             self._try_speak(best.tts_text, best.score)
 
         # ── Pathing slot ──────────────────────────────────────────────────────
-        with self.state.lock:
-            me_zone = self.state.jg_tracker.ally.last_zone or "unknown"
-            jg_safe = jg_tracker.safe_side()
 
         path_label, path_lvl = self.pathing_advisor.pathing_label(
             me_zone, self.obj_tracker, game_time, jg_safe
@@ -173,15 +174,16 @@ class DecisionEngine:
 
         # ── Build slot ────────────────────────────────────────────────────────
         # Champion module takes priority; fall back to generic recommender
+        # Data was already copied out of the lock above — no lock needed here
         build_hint = None
         if self._champion_module and hasattr(self._champion_module, "build_hint"):
-            with self.state.lock:
-                build_hint = self._champion_module.build_hint(me, enemies, game_time)
+            build_hint = self._champion_module.build_hint(me, enemies, game_time)
         if not build_hint:
-            with self.state.lock:
-                build_hint = self.build_recommender.get_hint(me, enemies, game_time)
+            build_hint = self.build_recommender.get_hint(me, enemies, game_time)
         if build_hint:
-            self._push_slot("BUILD", build_hint, "", "info")
+            # Hard-cap at 38 chars to prevent text wrapping in the overlay
+            short = build_hint[:38] + "…" if len(build_hint) > 38 else build_hint
+            self._push_slot("BUILD", short, "", "info")
 
         # ── Recall hint ───────────────────────────────────────────────────────
         recall_hint = self.obj_tracker.recall_before_objective(game_time)

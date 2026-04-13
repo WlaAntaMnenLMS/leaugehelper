@@ -85,6 +85,11 @@ class ActionScorer:
         Always returns at least one result (fallback: farm).
         """
         scores: List[ActionResult] = []
+        enemy_jg_dead = jg_tracker.enemy.is_dead
+
+        # ── When enemy jungler is dead → surface that as the top action ───────
+        if enemy_jg_dead:
+            scores.append(self._score_free_map(me, jg_tracker, obj_tracker, game_time))
 
         # ── Recall ──────────────────────────────────────────────────────────
         recall = self._score_recall(me, obj_tracker, game_time)
@@ -104,19 +109,22 @@ class ActionScorer:
                     scores.append(result)
 
         # ── Farm sides ───────────────────────────────────────────────────────
-        scores.append(self._score_farm("top", me, jg_tracker, obj_tracker, game_time))
-        scores.append(self._score_farm("bot", me, jg_tracker, obj_tracker, game_time))
+        farm_bonus = 20 if enemy_jg_dead else 0   # free farm when JG is dead
+        scores.append(self._score_farm("top", me, jg_tracker, obj_tracker, game_time, farm_bonus))
+        scores.append(self._score_farm("bot", me, jg_tracker, obj_tracker, game_time, farm_bonus))
 
-        # ── Invade ───────────────────────────────────────────────────────────
-        for side in ("top", "bot"):
-            inv = self._score_invade(side, me, jg_tracker, obj_tracker, game_time)
-            if inv:
-                scores.append(inv)
+        # ── Invade ── skip entirely when enemy JG is dead (irrelevant) ────────
+        if not enemy_jg_dead:
+            for side in ("top", "bot"):
+                inv = self._score_invade(side, me, jg_tracker, obj_tracker, game_time)
+                if inv:
+                    scores.append(inv)
 
         # ── Hover lane ───────────────────────────────────────────────────────
-        hover = self._score_hover(me, enemies, jg_tracker, game_time)
-        if hover:
-            scores.append(hover)
+        if not enemy_jg_dead:
+            hover = self._score_hover(me, enemies, jg_tracker, game_time)
+            if hover:
+                scores.append(hover)
 
         # ── Apply champion modifiers ─────────────────────────────────────────
         if self.champion_module:
@@ -349,8 +357,9 @@ class ActionScorer:
         jg_tracker,
         obj_tracker: ObjectiveTracker,
         game_time: float,
+        bonus: float = 0,
     ) -> ActionResult:
-        score = config.SCORE_FARM_BASE
+        score = config.SCORE_FARM_BASE + bonus
 
         # Bonus: enemy jungler is confirmed on OTHER side
         safe = jg_tracker.safe_side()
@@ -363,8 +372,7 @@ class ActionScorer:
             score -= 15
 
         # Bonus: objective is on this side
-        mins = game_time / 60.0
-        if side == "bot" and obj_tracker.time_until_dragon(game_time) <= 90:
+        if side == "bot" and 0 < obj_tracker.time_until_dragon(game_time) <= 90:
             score += 10   # near dragon, farm bot side first
 
         # Penalty: objective very close → should be prepping, not just farming
@@ -372,7 +380,7 @@ class ActionScorer:
             score -= 10
 
         zone_label = "top" if side == "top" else "bot"
-        jg_info    = f"JG {jg_tracker.enemy.last_zone.replace('_', ' ')}" if jg_tracker.enemy.champion else ""
+        jg_info    = f"JG {jg_tracker.enemy.last_zone.replace('_', ' ')}" if jg_tracker.enemy.champion and not jg_tracker.enemy.is_dead else ""
         reason     = f"safe side{', ' + jg_info if jg_info else ''}"
 
         return ActionResult(
@@ -456,6 +464,47 @@ class ActionScorer:
             level      = "warn",
             tts_text   = f"hover {threat_side}",
             confidence = 0.6,
+        )
+
+    # ── Free map (enemy JG dead) ─────────────────────────────────────────────
+
+    def _score_free_map(
+        self,
+        me,
+        jg_tracker,
+        obj_tracker: ObjectiveTracker,
+        game_time: float,
+    ) -> ActionResult:
+        """
+        Called when the enemy jungler is confirmed dead.
+        This is the highest-value window in the game — free invade, pressure,
+        or objective control.
+        """
+        score = 78.0   # default high priority
+
+        # Boost even further if an objective is alive/imminent
+        t_drag = obj_tracker.time_until_dragon(game_time)
+        t_her  = obj_tracker.time_until_herald(game_time)
+        if t_drag == 0:
+            reason = f"{jg_tracker.enemy.champion} dead → TAKE DRAGON"
+            score  = 92.0
+        elif t_her is not None and t_her == 0:
+            reason = f"{jg_tracker.enemy.champion} dead → TAKE HERALD"
+            score  = 90.0
+        elif 0 < t_drag <= 60:
+            reason = f"{jg_tracker.enemy.champion} dead → path dragon ({int(t_drag)}s)"
+            score  = 85.0
+        else:
+            reason = f"{jg_tracker.enemy.champion} dead → invade/pressure freely"
+
+        return ActionResult(
+            action     = "FREE_MAP",
+            score      = score,
+            label      = "FREE MAP – JG dead",
+            reason     = reason,
+            level      = "critical",
+            tts_text   = "enemy jungler is dead, free map",
+            confidence = 1.0,
         )
 
     # ── Fallback ─────────────────────────────────────────────────────────────
