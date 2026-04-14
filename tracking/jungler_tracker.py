@@ -198,17 +198,31 @@ class JunglerTracker:
         """
         Return "top" or "bot" indicating which side is SAFER to operate on,
         based on where the enemy jungler was last seen.
-        Returns None if we don't have enough info.
+        Returns None if unknown or if JG is in mid/river (ambiguous).
         """
         zone = self.enemy.last_zone
-        if zone in ("top_lane", "top_river", "top_jungle"):
+        if zone in ("top_lane", "top_jungle"):
             return "bot"   # JG is top → bot side is safer
-        if zone in ("bot_lane", "bot_river", "bot_jungle"):
+        if zone in ("bot_lane", "bot_jungle"):
             return "top"   # JG is bot → top side is safer
+        # River zones: JG is between halves, neither side is clearly safe
         return None
 
     def threat_side(self) -> Optional[str]:
-        """The side the enemy jungler is threatening. Inverse of safe_side()."""
+        """
+        The lane the enemy jungler is most directly threatening.
+        Returns "top", "mid", or "bot", or None if unknown.
+        """
+        zone = self.enemy.last_zone
+        # JG confirmed in a lane → that lane is directly threatened
+        if zone == "mid_lane":
+            return "mid"
+        # River zones threaten the adjacent lane
+        if zone == "top_river":
+            return "top"
+        if zone == "bot_river":
+            return "bot"
+        # Pure jungle quadrants: inverse of safe_side
         s = self.safe_side()
         if s == "top":
             return "bot"

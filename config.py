@@ -83,6 +83,7 @@ GANK_BLOCK_MY_HP_PCT      = 25    # I'm too low to gank
 GANK_BLOCK_TARGET_HP_PCT  = 5     # Target is essentially dead already
 GANK_MIN_FINAL_SCORE      = 38    # Score must beat this to surface the rec
 GANK_JG_NEARBY_SECONDS    = 15    # Enemy JG seen within this many seconds → danger
+ALLY_MIN_HP_FOR_GANK      = 40   # ally needs ≥ this HP% to follow up a gank
 
 # ── Recall logic ─────────────────────────────────────────────────────────────
 RECALL_HP_CRITICAL  = 22    # RECALL NOW immediately

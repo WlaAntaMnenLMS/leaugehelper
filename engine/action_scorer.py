@@ -11,18 +11,16 @@ Candidate actions:
   RECALL
   OBJECTIVE_PREP
   HOVER_LANE
-  CROSS_MAP
+  FREE_MAP   (enemy JG dead)
 
 Hard rules (override scores):
   - My HP < GANK_BLOCK_MY_HP_PCT  → block all ganks
   - Objective imminent < 45s      → boost OBJECTIVE_PREP
   - RECALL triggers at recall thresholds
 
-Gank guard rails (all must pass to recommend a gank):
-  1. TrackedTarget.is_valid_gank_target() == True
-  2. Target zone is in GANKABLE_ZONES[lane]
-  3. My HP is above GANK_BLOCK_MY_HP_PCT
-  4. Score beats GANK_MIN_FINAL_SCORE
+Gank scoring uses ThreatMapBuilder for composite intelligence:
+  HP, in-combat, fed/starved, level diff, extended, JG safe/threat,
+  ally HP, recently died, back detected, objective imminent.
 """
 
 from __future__ import annotations
@@ -35,6 +33,7 @@ import config
 from tracking.target_state import TrackedTarget, Visibility
 from tracking.lane_classifier import GANKABLE_ZONES, is_extended, classify
 from engine.objective_tracker import ObjectiveTracker
+from engine.threat_map import ThreatMapBuilder, LaneThreat
 
 
 # ---------------------------------------------------------------------------
@@ -71,14 +70,17 @@ class ActionScorer:
                          that can apply modifiers to scores.
         """
         self.champion_module = champion_module
+        self._threat_builder = ThreatMapBuilder()
 
     def score_all(
         self,
-        me,                        # MyState
-        enemies: dict,             # champion → TrackedTarget
-        jg_tracker,                # JunglerTracker
+        me,                          # MyState
+        enemies:    dict,            # champion → TrackedTarget
+        allies:     dict,            # champion → TrackedTarget (ally laners)
+        jg_tracker,                  # JunglerTracker
         obj_tracker: ObjectiveTracker,
-        game_time: float,
+        event_proc,                  # EventProcessor (for fed/starved queries)
+        game_time:  float,
     ) -> List[ActionResult]:
         """
         Score every candidate action.  Returns a list sorted best-first.
@@ -87,56 +89,101 @@ class ActionScorer:
         scores: List[ActionResult] = []
         enemy_jg_dead = jg_tracker.enemy.is_dead
 
-        # ── When enemy jungler is dead → surface that as the top action ───────
+        # ── Enemy JG dead → free map is the top priority ─────────────────────
         if enemy_jg_dead:
             scores.append(self._score_free_map(me, jg_tracker, obj_tracker, game_time))
 
-        # ── Recall ──────────────────────────────────────────────────────────
+        # ── Recall ────────────────────────────────────────────────────────────
         recall = self._score_recall(me, obj_tracker, game_time)
         if recall:
             scores.append(recall)
 
-        # ── Objective prep ───────────────────────────────────────────────────
+        # ── Objective prep ─────────────────────────────────────────────────────
         obj = self._score_objective(me, obj_tracker, game_time)
         if obj:
             scores.append(obj)
 
-        # ── Gank candidates ──────────────────────────────────────────────────
+        # ── Gank candidates (via ThreatMap) ────────────────────────────────────
         if me.hp_percent >= config.GANK_BLOCK_MY_HP_PCT:
-            for lane in ("top", "mid", "bot"):
-                result = self._score_gank(lane, me, enemies, jg_tracker, obj_tracker, game_time)
-                if result:
-                    scores.append(result)
+            threat_map = self._threat_builder.build(
+                enemies, allies, jg_tracker, obj_tracker, event_proc, me, game_time
+            )
+            for lane_threat in threat_map.ranked():
+                if lane_threat.score >= config.GANK_MIN_FINAL_SCORE:
+                    # Extra zone safety check: target must be in a gankable zone
+                    tgt = lane_threat.target
+                    if tgt and tgt.last_zone in GANKABLE_ZONES.get(lane_threat.lane, set()):
+                        result = self._lane_threat_to_action(lane_threat, game_time)
+                        if result:
+                            scores.append(result)
 
-        # ── Farm sides ───────────────────────────────────────────────────────
-        farm_bonus = 20 if enemy_jg_dead else 0   # free farm when JG is dead
+        # ── Farm sides ─────────────────────────────────────────────────────────
+        farm_bonus = 20 if enemy_jg_dead else 0
         scores.append(self._score_farm("top", me, jg_tracker, obj_tracker, game_time, farm_bonus))
         scores.append(self._score_farm("bot", me, jg_tracker, obj_tracker, game_time, farm_bonus))
 
-        # ── Invade ── skip entirely when enemy JG is dead (irrelevant) ────────
+        # ── Invade – only when enemy JG is alive ───────────────────────────────
         if not enemy_jg_dead:
             for side in ("top", "bot"):
                 inv = self._score_invade(side, me, jg_tracker, obj_tracker, game_time)
                 if inv:
                     scores.append(inv)
 
-        # ── Hover lane ───────────────────────────────────────────────────────
+        # ── Hover lane ─────────────────────────────────────────────────────────
         if not enemy_jg_dead:
             hover = self._score_hover(me, enemies, jg_tracker, game_time)
             if hover:
                 scores.append(hover)
 
-        # ── Apply champion modifiers ─────────────────────────────────────────
+        # ── Champion modifiers ─────────────────────────────────────────────────
         if self.champion_module:
             for r in scores:
                 mod = self.champion_module.score_modifier(r.action, me, game_time)
                 r.score = min(100.0, max(0.0, r.score + mod))
 
-        # Sort descending by score
         scores.sort(key=lambda r: r.score, reverse=True)
         return scores if scores else [self._fallback_farm()]
 
-    # ── Recall scorer ────────────────────────────────────────────────────────
+    # ── ThreatMap → ActionResult conversion ──────────────────────────────────
+
+    def _lane_threat_to_action(
+        self,
+        lane_threat: LaneThreat,
+        game_time: float,
+    ) -> Optional[ActionResult]:
+        """Convert a LaneThreat (from ThreatMap) into an ActionResult for the overlay."""
+        target = lane_threat.target
+        if target is None:
+            return None
+
+        hp = target.get_valid_hp_for_gank(game_time)
+        if hp is None:
+            return None
+
+        lane  = lane_threat.lane
+        # Add gank base score so ganks fairly compete with farm/invade
+        score = lane_threat.score + config.SCORE_GANK_BASE
+        reason = lane_threat.reason
+
+        # Downgrade if ally can't follow up (still show but lower urgency)
+        if not lane_threat.ally_ok:
+            level = "warn"
+        else:
+            level = "critical" if score >= 65 else "warn"
+
+        prefix = "GANK" if level == "critical" else "Gank"
+
+        return ActionResult(
+            action     = f"GANK_{lane.upper()}",
+            score      = score,
+            label      = f"{prefix} {lane}",
+            reason     = reason,
+            level      = level,
+            tts_text   = f"gank {lane}",
+            confidence = target.position_confidence,
+        )
+
+    # ── Recall scorer ──────────────────────────────────────────────────────────
 
     def _score_recall(
         self, me, obj_tracker: ObjectiveTracker, game_time: float
@@ -144,7 +191,6 @@ class ActionScorer:
         score = 0.0
         reason_parts = []
 
-        # HP triggers
         if me.hp_percent <= config.RECALL_HP_CRITICAL:
             score = 95.0
             reason_parts.append(f"critical HP {int(me.hp_percent)}%")
@@ -155,7 +201,6 @@ class ActionScorer:
             score += 50.0
             reason_parts.append(f"HP {int(me.hp_percent)}%")
 
-        # Gold triggers
         gold_label = None
         for threshold, label in config.RECALL_GOLD_TIERS:
             if me.gold >= threshold:
@@ -177,8 +222,8 @@ class ActionScorer:
         if score < 30:
             return None
 
-        reason = "  |  ".join(reason_parts) if reason_parts else "consider recalling"
-        is_crit = score >= 80
+        reason   = "  |  ".join(reason_parts) if reason_parts else "consider recalling"
+        is_crit  = score >= 80
         return ActionResult(
             action     = "RECALL",
             score      = score,
@@ -189,7 +234,7 @@ class ActionScorer:
             confidence = 1.0,
         )
 
-    # ── Objective scorer ──────────────────────────────────────────────────────
+    # ── Objective scorer ───────────────────────────────────────────────────────
 
     def _score_objective(
         self, me, obj_tracker: ObjectiveTracker, game_time: float
@@ -199,8 +244,8 @@ class ActionScorer:
             return None
 
         msg, lvl = warning
-        t_drag = obj_tracker.time_until_dragon(game_time)
-        score  = 0.0
+        t_drag   = obj_tracker.time_until_dragon(game_time)
+        score    = 0.0
 
         if t_drag <= 20:
             score = 92.0
@@ -221,134 +266,7 @@ class ActionScorer:
             confidence = 0.95,
         )
 
-    # ── Gank scorer ───────────────────────────────────────────────────────────
-
-    def _score_gank(
-        self,
-        lane: str,
-        me,
-        enemies: dict,
-        jg_tracker,
-        obj_tracker: ObjectiveTracker,
-        game_time: float,
-    ) -> Optional[ActionResult]:
-        """
-        Score ganking a specific lane.  Returns None if the gank is invalid
-        (no target, bad position, low confidence, etc.).
-
-        FIX over old version:
-          - Requires is_valid_gank_target() == True (position confidence + HP validity)
-          - Requires target zone to be in GANKABLE_ZONES[lane]
-          - HP shown only when valid; never shows 0% or stale values
-          - Does NOT default to "top" – each lane is independently evaluated
-        """
-        targets = [t for t in enemies.values() if _role_matches_lane(t.role, lane)]
-        if not targets:
-            return None
-
-        # Use the most dangerous (lowest HP + best confidence) target
-        best_target: Optional[TrackedTarget] = None
-        for t in targets:
-            if t.is_valid_gank_target(game_time):
-                if best_target is None or t.hp_percent < best_target.hp_percent:
-                    best_target = t
-
-        if best_target is None:
-            return None   # No valid gank target in this lane
-
-        # Zone check: target must be in a position where a gank makes sense
-        allowed_zones = GANKABLE_ZONES.get(lane, set())
-        if best_target.last_zone not in allowed_zones:
-            return None   # Target is in base or wrong area
-
-        # Get valid HP for display + scoring
-        hp = best_target.get_valid_hp_for_gank(game_time)
-        if hp is None:
-            return None   # No valid HP data – cannot score the gank
-
-        # ── Score calculation ────────────────────────────────────────────────
-        score = config.SCORE_GANK_BASE
-
-        # HP factor — single most important gank signal
-        if hp <= config.SCORE_ENEMY_LOW_HP_THRESH:
-            score += config.SCORE_ENEMY_LOW_HP
-        elif hp <= config.SCORE_ENEMY_MED_HP_THRESH:
-            score += config.SCORE_ENEMY_MED_HP
-
-        # Extended (past river line) — minimap-confirmed only
-        is_extended_flag = False
-        if best_target.last_minimap_pos and not best_target.zone_inferred:
-            mx, my = best_target.last_minimap_pos
-            enemy_team = best_target.team
-            my_team    = "ORDER" if enemy_team == "CHAOS" else "CHAOS"
-            if is_extended(mx, my, best_target.role, my_team):
-                score += config.SCORE_EXTENDED
-                is_extended_flag = True
-
-        # Level advantage — real players always consider this
-        level_diff = me.level - best_target.level
-        if level_diff >= 2:
-            score += 12   # significant level lead → easier kill
-        elif level_diff >= 1:
-            score += 6
-        elif level_diff <= -2:
-            score -= 10   # they outscale us at this level
-
-        # Early game aggression window (levels 1-6 are volatile)
-        mins = game_time / 60.0
-        if mins < 8:
-            score += 8   # early game ganks have highest kill potential
-
-        # Enemy jungler away from this side → safe window
-        safe = jg_tracker.safe_side()
-        if safe == lane:
-            score += config.SCORE_JG_FAR
-
-        # Enemy jungler recently seen on this side → danger
-        threat = jg_tracker.threat_side()
-        if threat == lane:
-            elapsed = jg_tracker.enemy.age(game_time)
-            if elapsed < 15:
-                score += config.SCORE_JG_NEARBY_PENALTY
-
-        # Position confidence penalty — stale minimap data
-        if best_target.visibility == Visibility.STALE:
-            score += config.SCORE_NO_VISION_PENALTY
-        # API-inferred zone (not minimap-confirmed) — small penalty
-        if best_target.zone_inferred:
-            score -= 8   # we're less certain of their exact position
-
-        # Objective penalty: don't gank when objective is about to spawn
-        if obj_tracker.is_objective_imminent(game_time, 35.0):
-            score -= 30
-
-        # Hard minimum
-        if score < config.GANK_MIN_FINAL_SCORE:
-            return None
-
-        # ── Build output ─────────────────────────────────────────────────────
-        hp_str    = f"{int(hp)}%"
-        zone_str  = best_target.last_zone.replace("_", " ")
-        inferred  = " (est.)" if best_target.zone_inferred else ""
-        ext_str   = ", extended" if is_extended_flag else ""
-        lvl_str   = f" Lv{best_target.level}" if best_target.level > 1 else ""
-        reason    = f"{best_target.champion}{lvl_str} {hp_str} HP, {zone_str}{inferred}{ext_str}"
-
-        is_critical = score >= 65
-        lvl    = "critical" if is_critical else "warn"
-        prefix = "GANK" if is_critical else "Gank"
-
-        return ActionResult(
-            action     = f"GANK_{lane.upper()}",
-            score      = score,
-            label      = f"{prefix} {lane}",
-            reason     = reason,
-            level      = lvl,
-            tts_text   = f"gank {lane}",
-            confidence = best_target.position_confidence,
-        )
-
-    # ── Farm scorer ──────────────────────────────────────────────────────────
+    # ── Farm scorer ────────────────────────────────────────────────────────────
 
     def _score_farm(
         self,
@@ -356,44 +274,41 @@ class ActionScorer:
         me,
         jg_tracker,
         obj_tracker: ObjectiveTracker,
-        game_time: float,
-        bonus: float = 0,
+        game_time:   float,
+        bonus:       float = 0,
     ) -> ActionResult:
         score = config.SCORE_FARM_BASE + bonus
 
-        # Bonus: enemy jungler is confirmed on OTHER side
-        safe = jg_tracker.safe_side()
+        safe   = jg_tracker.safe_side()
+        threat = jg_tracker.threat_side()
+
         if safe == side:
             score += 20   # this side is confirmed safe
-
-        # Penalty: enemy jungler recently seen on this side
-        threat = jg_tracker.threat_side()
         if threat == side:
-            score -= 15
+            score -= 15   # enemy JG recently seen this side
 
-        # Bonus: objective is on this side
         if side == "bot" and 0 < obj_tracker.time_until_dragon(game_time) <= 90:
-            score += 10   # near dragon, farm bot side first
+            score += 10   # near dragon, farm bot first
 
-        # Penalty: objective very close → should be prepping, not just farming
         if obj_tracker.is_objective_imminent(game_time, 45.0):
             score -= 10
 
-        zone_label = "top" if side == "top" else "bot"
-        jg_info    = f"JG {jg_tracker.enemy.last_zone.replace('_', ' ')}" if jg_tracker.enemy.champion and not jg_tracker.enemy.is_dead else ""
-        reason     = f"safe side{', ' + jg_info if jg_info else ''}"
+        jg_info   = (f"JG {jg_tracker.enemy.last_zone.replace('_', ' ')}"
+                     if jg_tracker.enemy.champion and not jg_tracker.enemy.is_dead
+                     else "")
+        reason    = f"safe side{', ' + jg_info if jg_info else ''}"
 
         return ActionResult(
             action     = f"FARM_{side.upper()}_SIDE",
             score      = score,
-            label      = f"Farm {zone_label} camps",
+            label      = f"Farm {side} camps",
             reason     = reason,
             level      = "info",
-            tts_text   = f"farm {zone_label} side",
+            tts_text   = f"farm {side} side",
             confidence = 0.8,
         )
 
-    # ── Invade scorer ────────────────────────────────────────────────────────
+    # ── Invade scorer ──────────────────────────────────────────────────────────
 
     def _score_invade(
         self,
@@ -401,25 +316,22 @@ class ActionScorer:
         me,
         jg_tracker,
         obj_tracker: ObjectiveTracker,
-        game_time: float,
+        game_time:   float,
     ) -> Optional[ActionResult]:
-        # Only suggest invade if enemy jungler is confirmed on the other side
         safe = jg_tracker.safe_side()
         if safe != side:
             return None
 
-        # Don't invade late game when baron is close
         if obj_tracker.is_objective_imminent(game_time, 50.0):
             return None
 
-        # Invades make most sense early-mid game
         mins = game_time / 60.0
         if mins > 20:
             return None
 
         score = 38.0
         if jg_tracker.enemy.age(game_time) < 15:
-            score += 15  # high-confidence JG position
+            score += 15
 
         reason = f"enemy JG confirmed {jg_tracker.threat_side() or '?'} side"
         return ActionResult(
@@ -432,7 +344,7 @@ class ActionScorer:
             confidence = jg_tracker.enemy.position_confidence,
         )
 
-    # ── Hover scorer ─────────────────────────────────────────────────────────
+    # ── Hover scorer ────────────────────────────────────────────────────────────
 
     def _score_hover(
         self,
@@ -441,17 +353,10 @@ class ActionScorer:
         jg_tracker,
         game_time: float,
     ) -> Optional[ActionResult]:
-        """
-        Suggest hovering a lane when ally is in danger but gank isn't clean.
-        Only fires when an ally lane has pressure signs.
-        """
-        # Simple heuristic: if enemy jungler MIA and one ally lane is losing
-        # (we don't have ally HP here, so keep this minimal for now)
         elapsed = jg_tracker.enemy.age(game_time)
         if elapsed < config.JG_WARN_S:
-            return None  # JG recently seen, no danger
+            return None
 
-        # JG is missing → suggest hovering a lane to prevent ganks
         threat_side = jg_tracker.threat_side()
         if not threat_side:
             return None
@@ -466,25 +371,20 @@ class ActionScorer:
             confidence = 0.6,
         )
 
-    # ── Free map (enemy JG dead) ─────────────────────────────────────────────
+    # ── Free map (enemy JG dead) ───────────────────────────────────────────────
 
     def _score_free_map(
         self,
         me,
         jg_tracker,
         obj_tracker: ObjectiveTracker,
-        game_time: float,
+        game_time:   float,
     ) -> ActionResult:
-        """
-        Called when the enemy jungler is confirmed dead.
-        This is the highest-value window in the game — free invade, pressure,
-        or objective control.
-        """
-        score = 78.0   # default high priority
+        score = 78.0
 
-        # Boost even further if an objective is alive/imminent
         t_drag = obj_tracker.time_until_dragon(game_time)
         t_her  = obj_tracker.time_until_herald(game_time)
+
         if t_drag == 0:
             reason = f"{jg_tracker.enemy.champion} dead → TAKE DRAGON"
             score  = 92.0
@@ -507,7 +407,7 @@ class ActionScorer:
             confidence = 1.0,
         )
 
-    # ── Fallback ─────────────────────────────────────────────────────────────
+    # ── Fallback ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def _fallback_farm() -> ActionResult:
@@ -527,11 +427,10 @@ class ActionScorer:
 # ---------------------------------------------------------------------------
 
 def _role_matches_lane(role: str, lane: str) -> bool:
-    """Check if an API role corresponds to the given lane name."""
     return {
-        "top":  role == "TOP",
-        "mid":  role == "MIDDLE",
-        "bot":  role in ("BOTTOM", "UTILITY"),
+        "top": role == "TOP",
+        "mid": role == "MIDDLE",
+        "bot": role in ("BOTTOM", "UTILITY"),
     }.get(lane, False)
 
 
