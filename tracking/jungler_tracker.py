@@ -20,11 +20,13 @@ Output messages:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import math
+from typing import List, Optional, Tuple
 
 import config
 from tracking.target_state import TrackedTarget, Visibility
 from tracking.lane_classifier import classify
+from tracking.jungler_belief import JunglerBelief
 
 
 class JunglerTracker:
@@ -35,6 +37,9 @@ class JunglerTracker:
         self.ally:  TrackedTarget = TrackedTarget()
         self._identified: bool = False
         self._my_team:    str  = ""
+
+        # Probabilistic zone belief (wraps the deterministic TrackedTarget)
+        self.belief: JunglerBelief = JunglerBelief()
 
         # Chat de-dup: only fire a chat message when the side changes
         self._last_chat_side:      str   = ""
@@ -119,6 +124,13 @@ class JunglerTracker:
                 if p.get("championName") == jg.champion and p.get("team") == jg.team:
                     jg.update_from_api(p, game_time)
                     break
+
+        # If JG confirmed dead → reset belief to base zones
+        if self.enemy.is_dead:
+            self.belief.reset_to_base()
+        else:
+            self.belief.tick(game_time)
+
         # Decay confidence on both
         self.enemy.update_confidence(game_time)
         self.ally.update_confidence(game_time)
@@ -129,22 +141,29 @@ class JunglerTracker:
         game_time: float,
     ) -> None:
         """
-        Receive detected minimap dot positions and attempt to update the
-        enemy jungler's location.
+        Receive detected minimap dot positions and update the enemy JG location.
 
-        Strategy:
-          1. Filter out positions that clearly belong to laners (extreme corners).
-          2. From remaining positions, pick the one closest to the last known
-             position if multiple candidates remain.
-          3. If no candidate, mark the enemy jungler as not visible this frame.
+        Improvements over v1:
+          1. Filter high-confidence lane-zone dots (they're almost certainly laners).
+          2. Apply velocity check: reject positions requiring unrealistic movement.
+          3. Pick closest-to-last-known from remaining candidates.
+          4. Update both TrackedTarget AND JunglerBelief.
         """
         if not self.enemy.champion:
             return
 
         candidates = _filter_non_laner_positions(positions)
 
+        # Velocity filter: remove positions that require superhuman movement
+        if self.enemy.last_minimap_pos and self.enemy.last_seen_game_time > 0:
+            elapsed = max(0.1, game_time - self.enemy.last_seen_game_time)
+            candidates = _filter_by_velocity(
+                candidates, self.enemy.last_minimap_pos, elapsed
+            )
+
         if not candidates:
             self.enemy.mark_not_visible()
+            self.belief.tick(game_time)
             return
 
         # Choose best candidate
@@ -155,6 +174,9 @@ class JunglerTracker:
 
         zone, zone_conf = classify(pos[0], pos[1])
         self.enemy.update_from_minimap(pos, zone, zone_conf, game_time)
+
+        # Update probabilistic belief with this sighting
+        self.belief.update_from_sighting(zone, zone_conf, game_time)
 
     def mark_all_not_visible(self) -> None:
         """Called when no minimap dots are detected at all."""
@@ -276,21 +298,54 @@ def _filter_non_laner_positions(
     """
     Remove dots that almost certainly belong to laners rather than the jungler.
 
-    Laners congregate at lane extremes (corners + edges), junglers are in
-    the middle.  This is a heuristic filter; it reduces noise but may miss
-    the jungler if they're ganking a lane.
+    Two-stage filter:
+      1. Geometric: exclude base corners and extreme border pixels.
+      2. Zone-classifier: exclude dots whose zone is a pure lane corridor
+         with confidence ≥ JG_LANER_FILTER_CONF (they're almost certainly
+         laners, not the jungler).
+
+    The zone check is intentionally lenient — we only exclude HIGH-confidence
+    lane dots so we still catch the JG when they're actively ganking a lane.
     """
     filtered = []
     for pos in positions:
         x, y = pos
-        # Exclude deep base corners
+        # Stage 1: geometric exclusions
         if (x < 10 and y > 90) or (x > 90 and y < 10):
-            continue
-        # Exclude pure border pixels (likely base or extreme lane)
+            continue  # deep base corners
         if x < 6 or x > 94 or y < 6 or y > 94:
-            continue
+            continue  # extreme border / outside minimap
+
+        # Stage 2: zone-classifier exclusion
+        zone, conf = classify(x, y)
+        if conf >= config.JG_LANER_FILTER_CONF and zone in (
+            "top_lane", "mid_lane", "bot_lane"
+        ):
+            continue  # almost certainly a laner, not the JG
+
         filtered.append(pos)
     return filtered
+
+
+def _filter_by_velocity(
+    candidates: list,
+    last_pos:   Tuple[float, float],
+    elapsed_s:  float,
+) -> list:
+    """
+    Reject candidate positions that would require the JG to move faster than
+    JG_MAX_MOVE_PCT_PER_S (minimap %-units per second).
+
+    League champion base move speed ≈ 400 units/s on a ~14 000-unit map →
+    ~2.9 minimap-% per second.  We add a 1.7× buffer for dashes / blinks /
+    teleport, giving a cap of ~5%/s (configurable via JG_MAX_MOVE_PCT_PER_S).
+    """
+    max_dist = config.JG_MAX_MOVE_PCT_PER_S * elapsed_s
+    rx, ry = last_pos
+    return [
+        p for p in candidates
+        if math.sqrt((p[0] - rx) ** 2 + (p[1] - ry) ** 2) <= max_dist
+    ]
 
 
 def _closest(

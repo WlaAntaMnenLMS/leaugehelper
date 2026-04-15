@@ -26,7 +26,7 @@ Gank scoring uses ThreatMapBuilder for composite intelligence:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import config
@@ -43,13 +43,18 @@ from engine.threat_map import ThreatMapBuilder, LaneThreat
 @dataclass
 class ActionResult:
     """A scored action with a human-readable explanation."""
-    action:      str    # e.g. "GANK_MID"
-    score:       float  # 0–100
-    label:       str    # short display label, e.g. "Gank mid"
-    reason:      str    # explanation, e.g. "Azir 38% HP, extended"
-    level:       str    # overlay colour level: info / warn / critical
-    tts_text:    str    # spoken text, short
-    confidence:  float  # 0–1 confidence in this recommendation
+    action:         str          # e.g. "GANK_MID"
+    score:          float        # 0–100
+    label:          str          # short display label, e.g. "Gank mid"
+    reason:         str          # explanation, e.g. "Azir 38% HP, extended"
+    level:          str          # overlay colour level: info / warn / critical
+    tts_text:       str          # spoken text, short
+    confidence:     float        # 0–1 position / ID confidence
+    # EV model outputs (only set for GANK actions; 0 / empty elsewhere)
+    success_prob:   float = 0.0  # p(kill) from sigmoid model
+    expected_value: float = 0.0  # EV = p*reward - (1-p)*risk
+    reasons:        list  = field(default_factory=list)   # positive signals
+    risks:          list  = field(default_factory=list)   # negative signals
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +168,28 @@ class ActionScorer:
         lane  = lane_threat.lane
         # Add gank base score so ganks fairly compete with farm/invade
         score = lane_threat.score + config.SCORE_GANK_BASE
+
+        # ── EV model (sigmoid probability) ────────────────────────────────────
+        extended_flag = "extended" in lane_threat.reason or "in river" in lane_threat.reason
+        jg_away_flag  = "JG away"  in lane_threat.reason
+        in_combat     = getattr(target, "in_combat", False)
+        fed_flag      = getattr(target, "is_fed", False)
+
+        logit = (
+            config.EV_W0
+            + config.EV_W_HP      * lane_threat.hp_signal
+            + config.EV_W_LEVEL   * lane_threat.level_diff
+            + config.EV_W_EXTENDED * (1 if extended_flag else 0)
+            + config.EV_W_JG_AWAY  * (1 if jg_away_flag  else 0)
+            + config.EV_W_INCOMBAT * (1 if in_combat      else 0)
+            + config.EV_W_FED      * (1 if fed_flag       else 0)
+        )
+        success_prob   = 1.0 / (1.0 + math.exp(-logit))
+        expected_value = (
+            success_prob * config.EV_REWARD_KILL
+            - (1.0 - success_prob) * config.EV_RISK_COST
+        )
+
         reason = lane_threat.reason
 
         # Downgrade if ally can't follow up (still show but lower urgency)
@@ -174,13 +201,17 @@ class ActionScorer:
         prefix = "GANK" if level == "critical" else "Gank"
 
         return ActionResult(
-            action     = f"GANK_{lane.upper()}",
-            score      = score,
-            label      = f"{prefix} {lane}",
-            reason     = reason,
-            level      = level,
-            tts_text   = f"gank {lane}",
-            confidence = target.position_confidence,
+            action         = f"GANK_{lane.upper()}",
+            score          = score,
+            label          = f"{prefix} {lane}",
+            reason         = reason,
+            level          = level,
+            tts_text       = f"gank {lane}",
+            confidence     = target.position_confidence,
+            success_prob   = round(success_prob, 2),
+            expected_value = round(expected_value, 1),
+            reasons        = list(lane_threat.reason.split(" – ")[-1:]),
+            risks          = list(lane_threat.risks),
         )
 
     # ── Recall scorer ──────────────────────────────────────────────────────────

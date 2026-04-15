@@ -1,16 +1,17 @@
 """
 Fixed-slot always-on-top overlay using tkinter.
 
-Layout (6 fixed rows, always visible):
+Layout (7 fixed rows, always visible):
   ┌─────────────────────────────────────────┐
   │ ≡  League Advisor              [×]      │  ← draggable header
   ├─────────────────────────────────────────┤
-  │ JG   Kayn bot (8s)                      │
-  │ ACT  GANK mid  –  Syndra 38% HP         │
+  │ JG   Kayn bot (8s) [likely bot jungle]  │  ← belief label appended
+  │ ACT  GANK mid  –  Syndra 38% p=72% EV+44│
   │ PTH  Red → Gromp → Dragon               │
   │ OBJ  Dragon 1:45  2 Drakes/1 Drake      │
   │ BLD  Rush Hubris (SA)                   │
   │ ALT  First blood – enemy down!          │  ← auto-expires after 8s
+  │ SYS  api=12/0err mm=24/0err ticks=60    │  ← health counter (dim)
   └─────────────────────────────────────────┘
 
 Slots update whenever a new dict is pushed to the queue:
@@ -21,6 +22,7 @@ Levels map to colours:
   warn     → orange
   info     → white / green
   dim      → grey
+  offline  → orange-red (API offline)
 
 Thread safety:
   The overlay runs in the MAIN thread (tkinter requirement on Windows/macOS).
@@ -40,9 +42,10 @@ import tkinter as tk
 from typing import Dict, Optional
 
 import config
+from telemetry.logger import health
 
 # Slot display names (ordered top-to-bottom)
-SLOT_ORDER  = ["JG", "ACTION", "PATH", "OBJ", "BUILD", "ALERT"]
+SLOT_ORDER  = ["JG", "ACTION", "PATH", "OBJ", "BUILD", "ALERT", "SYS"]
 SLOT_LABELS = {
     "JG":     "JG",
     "ACTION": "ACT",
@@ -50,11 +53,13 @@ SLOT_LABELS = {
     "OBJ":    "OBJ",
     "BUILD":  "BLD",
     "ALERT":  "ALT",
+    "SYS":    "SYS",
 }
 
 LEVEL_COLORS  = config.OVERLAY_COLORS   # {"critical": ..., "warn": ..., ...}
 REFRESH_MS    = 300    # How often to poll the queue and reassert topmost
 ALERT_SHOW_S  = 8.0   # Seconds before the ALERT row auto-clears
+SYS_REFRESH   = 10    # Refresh health counter every N ticks (~3s)
 
 
 class Overlay:
@@ -74,6 +79,9 @@ class Overlay:
 
         # ALERT auto-expiry: wall-clock time when the slot should clear
         self._alert_expire_at: float = 0.0
+
+        # SYS health counter: refresh every SYS_REFRESH ticks
+        self._sys_tick_count: int = 0
 
         # Drag state
         self._drag_x = 0
@@ -193,7 +201,21 @@ class Overlay:
                 lbl.config(text="", fg=LEVEL_COLORS.get("dim", "#888888"))
             self._alert_expire_at = 0.0
 
+        # Refresh SYS health counter row periodically
+        self._sys_tick_count += 1
+        if self._sys_tick_count % SYS_REFRESH == 0:
+            self._refresh_sys_row()
+
         self._root.after(REFRESH_MS, self._tick)
+
+    def _refresh_sys_row(self) -> None:
+        lbl = self._labels.get("SYS")
+        if lbl is None:
+            return
+        lbl.config(
+            text=health.summary_line(),
+            fg=LEVEL_COLORS.get("dim", "#55556a"),
+        )
 
     def _apply_update(self, update: dict) -> None:
         slot   = update.get("slot",   "")

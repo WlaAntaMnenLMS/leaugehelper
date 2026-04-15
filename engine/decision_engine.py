@@ -36,6 +36,9 @@ from engine.objective_tracker import ObjectiveTracker
 from engine.action_scorer import ActionScorer
 from engine.pathing import PathingAdvisor
 from build.recommender import BuildRecommender
+from telemetry.logger import get_logger, health
+
+log = get_logger(__name__)
 
 
 class DecisionEngine:
@@ -64,11 +67,16 @@ class DecisionEngine:
         self._api_thread:      Optional[threading.Thread] = None
         self._decision_thread: Optional[threading.Thread] = None
 
-        # Champion module – set after identification
-        self._champion_module = None
+        # Champion module – set after identification; guarded by _champ_lock
+        self._champion_module      = None
+        self._champ_lock           = threading.Lock()
 
         # TTS (injected by main.py)
         self._tts = None
+
+        # Stale-data guard: track when we last received fresh API data
+        self._last_api_success: float = 0.0
+        self._stale_warned:     bool  = False
 
     def set_tts(self, tts) -> None:
         self._tts = tts
@@ -92,9 +100,11 @@ class DecisionEngine:
 
         self._api_thread.start()
         self._decision_thread.start()
+        log.info("DecisionEngine started (profile=%s)", config.ACTIVE_PROFILE)
 
     def stop(self) -> None:
         self._running = False
+        log.info("DecisionEngine stopped  %s", health.summary_line())
 
     def is_game_active(self) -> bool:
         """Return True if we have received at least one valid API response."""
@@ -107,14 +117,27 @@ class DecisionEngine:
         from api import live_client as lc
 
         while self._running:
+            t0 = time.monotonic()
             try:
                 data = lc.get_all_game_data()
                 if data:
                     self.state.update_from_api(data)
                     self.obj_tracker.update(self.state.objectives)
                     self._try_load_champion_module()
-            except Exception:
-                pass  # Game not running yet or API hiccup
+                    self._last_api_success = time.monotonic()
+                    health.increment("api_polls")
+                    self._stale_warned = False
+                    log.debug(
+                        "API poll ok  game_time=%.1f  dt=%.0fms",
+                        self.state.game_time,
+                        (time.monotonic() - t0) * 1000,
+                    )
+                else:
+                    health.increment("api_errors")
+                    log.debug("API returned no data")
+            except Exception as exc:
+                health.increment("api_errors")
+                log.warning("API poll failed: %s", exc)
             time.sleep(config.API_POLL_INTERVAL)
 
     # ── Decision loop ──────────────────────────────────────────────────────────
@@ -123,11 +146,34 @@ class DecisionEngine:
         while self._running:
             try:
                 self._tick()
+                health.increment("decision_ticks")
             except Exception:
-                traceback.print_exc()
+                log.error("Decision tick crashed:\n%s", traceback.format_exc())
             time.sleep(config.DECISION_INTERVAL)
 
     def _tick(self) -> None:
+        # ── Stale-data guard ─────────────────────────────────────────────────
+        wall_now   = time.monotonic()
+        api_age    = wall_now - self._last_api_success if self._last_api_success > 0 else 0
+        api_stale  = self._last_api_success > 0 and api_age > config.API_STALE_WARN_S
+        api_crit   = self._last_api_success > 0 and api_age > config.API_STALE_CRIT_S
+
+        if api_crit:
+            if not self._stale_warned:
+                log.warning("API data stale for %.0fs – suppressing recommendations", api_age)
+                self._stale_warned = True
+            self._push_slot(
+                "ACTION",
+                f"API offline ({int(api_age)}s) – paused",
+                "",
+                "offline" if "offline" in config.COLORS else "critical",
+            )
+            return
+
+        if api_stale and not self._stale_warned:
+            log.warning("API data stale for %.0fs", api_age)
+            self._stale_warned = True
+
         # ── Snapshot ALL state out of the lock in one block ───────────────────
         with self.state.lock:
             if self.state.game_time < 1.0:
@@ -146,20 +192,39 @@ class DecisionEngine:
         pending_alerts = self.state.pop_alerts()
 
         # ── Score actions (all heavy computation outside the lock) ────────────
-        self.scorer.champion_module = self._champion_module
+        with self._champ_lock:
+            champ_mod = self._champion_module
+        self.scorer.champion_module = champ_mod
         results = self.scorer.score_all(
             me, enemies, allies, jg_tracker,
             self.obj_tracker, event_proc, game_time,
         )
         best = results[0] if results else None
 
-        # ── JG slot ───────────────────────────────────────────────────────────
-        jg_msg, jg_lvl = jg_tracker.status_message(game_time)
-        self._push_slot("JG", jg_msg, "", jg_lvl)
-
-        # ── ACTION slot ───────────────────────────────────────────────────────
         if best:
-            self._push_slot("ACTION", best.label, best.reason, best.level)
+            log.debug(
+                "Best action: %s  score=%.1f  p=%.2f  EV=%.1f  conf=%.2f",
+                best.action, best.score, best.success_prob,
+                best.expected_value, best.confidence,
+            )
+
+        # ── JG slot – belief label enriches the deterministic status ─────────
+        jg_msg, jg_lvl = jg_tracker.status_message(game_time)
+        belief_label   = jg_tracker.belief.label()
+        jg_full        = f"{jg_msg}  [{belief_label}]" if belief_label else jg_msg
+        self._push_slot("JG", jg_full, "", jg_lvl)
+
+        # ── ACTION slot – include p(kill) and EV for gank actions ─────────────
+        if best:
+            if best.action.startswith("GANK") and best.success_prob > 0:
+                reason_with_ev = (
+                    f"{best.reason}  "
+                    f"p={int(best.success_prob * 100)}%  "
+                    f"EV={best.expected_value:+.0f}"
+                )
+                self._push_slot("ACTION", best.label, reason_with_ev, best.level)
+            else:
+                self._push_slot("ACTION", best.label, best.reason, best.level)
             self._try_speak(best.tts_text, best.score)
 
         # ── PATH slot ─────────────────────────────────────────────────────────
@@ -253,8 +318,10 @@ class DecisionEngine:
 
     def _push_build_slot(self, me, enemies: dict, game_time: float) -> None:
         build_hint = None
-        if self._champion_module and hasattr(self._champion_module, "build_hint"):
-            build_hint = self._champion_module.build_hint(me, enemies, game_time)
+        with self._champ_lock:
+            mod = self._champion_module
+        if mod and hasattr(mod, "build_hint"):
+            build_hint = mod.build_hint(me, enemies, game_time)
         if not build_hint:
             build_hint = self.build_recommender.get_hint(me, enemies, game_time)
         if build_hint:
@@ -271,13 +338,14 @@ class DecisionEngine:
                 {"slot": slot, "label": label, "reason": reason, "level": level}
             )
         except queue.Full:
-            pass
+            health.increment("dropped_updates")
 
     def _try_speak(self, text: str, score: float) -> None:
         if self._tts is None:
             return
         if score >= config.TTS_MIN_SCORE:
             self._tts.speak(text)
+            health.increment("tts_calls")
 
     def _try_speak_alert(self, text: str, level: str) -> None:
         """Speak critical kill-feed alerts via TTS."""
@@ -285,11 +353,13 @@ class DecisionEngine:
             return
         if level == "critical":
             self._tts.speak(text)
+            health.increment("tts_calls")
 
     def _try_load_champion_module(self) -> None:
         """Load champion-specific module once we know who we're playing."""
-        if self._champion_module is not None:
-            return
+        with self._champ_lock:
+            if self._champion_module is not None:
+                return
 
         with self.state.lock:
             champ = self.state.me.champion.lower()
@@ -298,16 +368,22 @@ class DecisionEngine:
             return
 
         module = None
-        if champ == "kayn":
-            from champions.kayn import KaynModule
-            module = KaynModule()
-        elif champ == "viego":
-            from champions.viego import ViegoModule
-            module = ViegoModule()
-        elif champ == "warwick":
-            from champions.warwick import WarwickModule
-            module = WarwickModule()
+        try:
+            if champ == "kayn":
+                from champions.kayn import KaynModule
+                module = KaynModule()
+            elif champ == "viego":
+                from champions.viego import ViegoModule
+                module = ViegoModule()
+            elif champ == "warwick":
+                from champions.warwick import WarwickModule
+                module = WarwickModule()
+        except Exception as exc:
+            log.warning("Failed to load champion module for %s: %s", champ, exc)
+            return
 
         if module:
-            self._champion_module = module
+            with self._champ_lock:
+                self._champion_module = module
             self.pathing_advisor.champion = champ
+            log.info("Loaded champion module: %s", champ)
